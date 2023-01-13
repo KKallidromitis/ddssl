@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-DATA_DIR="../../../data/kinetics400/annotations"
+DATA_DIR="./annotations"
 
 if [[ ! -d "${DATA_DIR}" ]]; then
   echo "${DATA_DIR} does not exist. Creating";
