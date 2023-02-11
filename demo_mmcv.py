@@ -149,7 +149,7 @@ import os
 cfg.data.train.dataset.pipeline=train_pipeline
 datasets = [build_dataset(cfg.data.train)]
 model = build_model(cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
-model = ReparamModule(model)
+#model = ReparamModule(model)
 # model = DDP(model,delay_allreduce=True)
 
 world_size = int(os.environ['WORLD_SIZE'])
@@ -161,8 +161,64 @@ sampler = torch.utils.data.DistributedSampler(
             datasets[0], num_replicas=world_size, rank=rank, shuffle=True
 )
 
-flat_param = model.flat_param
-optimizer_model = SGD([flat_param],lr=0.05, momentum=0.9, weight_decay=0.0001)
+
+def distance_wb(gwr, gws):
+    shape = gwr.shape
+    if len(shape) == 4: # conv, out*in*h*w
+        gwr = gwr.reshape(shape[0], shape[1] * shape[2] * shape[3])
+        gws = gws.reshape(shape[0], shape[1] * shape[2] * shape[3])
+    elif len(shape) == 3:  # layernorm, C*h*w
+        gwr = gwr.reshape(shape[0], shape[1] * shape[2])
+        gws = gws.reshape(shape[0], shape[1] * shape[2])
+    elif len(shape) == 2: # linear, out*in
+        tmp = 'do nothing'
+    elif len(shape) == 1: # batchnorm/instancenorm, C; groupnorm x, bias
+        gwr = gwr.reshape(1, shape[0])
+        gws = gws.reshape(1, shape[0])
+        return torch.tensor(0, dtype=torch.float, device=gwr.device)
+
+    dis_weight = torch.sum(1 - torch.sum(gwr * gws, dim=-1) / (torch.norm(gwr, dim=-1) * torch.norm(gws, dim=-1) + 0.000001))
+    dis = dis_weight
+    return dis
+
+def calc_match_loss(gw_syn, gw_real, dis_metric='ours'):
+    dis = torch.tensor(0.0).to(gw_real[0].device)
+
+    if dis_metric == 'ours':
+        for ig in range(len(gw_real)):
+            gwr = gw_real[ig]
+            gws = gw_syn[ig]
+            dis += distance_wb(gwr, gws)
+
+    elif dis_metric == 'mse':
+        gw_real_vec = []
+        gw_syn_vec = []
+        for ig in range(len(gw_real)):
+            gw_real_vec.append(gw_real[ig].reshape((-1)))
+            gw_syn_vec.append(gw_syn[ig].reshape((-1)))
+        gw_real_vec = torch.cat(gw_real_vec, dim=0)
+        gw_syn_vec = torch.cat(gw_syn_vec, dim=0)
+        dis = torch.sum((gw_syn_vec - gw_real_vec)**2)
+
+    elif dis_metric == 'cos':
+        gw_real_vec = []
+        gw_syn_vec = []
+        for ig in range(len(gw_real)):
+            gw_real_vec.append(gw_real[ig].reshape((-1)))
+            gw_syn_vec.append(gw_syn[ig].reshape((-1)))
+        gw_real_vec = torch.cat(gw_real_vec, dim=0)
+        gw_syn_vec = torch.cat(gw_syn_vec, dim=0)
+        dis = 1 - torch.sum(gw_real_vec * gw_syn_vec, dim=-1) / (torch.norm(gw_real_vec, dim=-1) * torch.norm(gw_syn_vec, dim=-1) + 0.000001)
+
+    else:
+        exit('unknown distance function: %s'%dis_metric)
+
+    return dis
+
+#flat_param = model.flat_param
+net_parameters = list(model.parameters())
+
+optimizer_model = SGD(model.parameters(),lr=0.05, momentum=0.9, weight_decay=0.0001)
 BATCH_SIZE = 64
 
 dataloader = DataLoader(datasets[0],batch_size=BATCH_SIZE,sampler=sampler,num_workers=8,drop_last=True)
@@ -173,19 +229,25 @@ torch.cuda.set_device(local_rank)
 model.to(device)
 model.train()
 np.random.seed(0)
-total_iter = len(datasets[0]) // BATCH_SIZE
+total_iter = len(datasets[0]) // (BATCH_SIZE * world_size)
 
 
+def set_batch_norm(model,on=True):
+    for module in model.modules():
+        if 'BatchNorm' in module._get_name():  #BatchNorm
+            module.eval() # fix mu and sigma of every BatchNorm layer
 start_time = time.time()
 end = time.time()
 assert BATCH_SIZE * world_size < len(indices) # Cannot have larger global batch size than syn dataset size
 if local_rank == 0:
     wandb.init()
+
 for epoch in range(epoches):
     sampler.set_epoch(epoch)
     iter = 0
     
     for batch in dataloader:
+        model.train()
         #TODO: see if there is a smarter way
         idx = np.random.choice(indices,BATCH_SIZE * world_size,replace=False)
         # print(idx[:10]) sanity check to make sure they are in sync
@@ -195,30 +257,37 @@ for epoch in range(epoches):
         syn_batch.requires_grad=True
         real_video_aug,parms = apply_kornia(aug_list,batch['imgs'].to(device))
         syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
-        r = model(real_video_aug,flat_param=flat_param)
-        r_syn = model(syn_video_aug,flat_param=flat_param)
+        r = model(real_video_aug)
+        # disable bn
+        for module in model.modules():
+            if 'BatchNorm' in module._get_name():  #BatchNorm
+                module.eval() # fix mu and sigma of every BatchNorm layer
+        r_syn = model(syn_video_aug)
 
         optimizer = SGD([syn_batch,],lr=0.05, momentum=0.9, weight_decay=0.0001)
 
         vfs_loss_real = r['img_head.0.loss_feat' ].mean()
         vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
-        gw_real = torch.autograd.grad(vfs_loss_real, flat_param,retain_graph=True)[0].detach()
-        gw_syn = torch.autograd.grad(vfs_loss_syn, flat_param, create_graph=True)[0]
+        gw_real = torch.autograd.grad(vfs_loss_real, net_parameters,retain_graph=True)
+        gw_real = list((x.detach() for x in gw_real))
+        gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
 
         # do match SGD
-        match_loss = nn.functional.mse_loss(gw_syn*10,gw_real*10)
+        match_loss = calc_match_loss(gw_real,gw_syn)
+        
         optimizer.zero_grad()
         match_loss.backward()
-        syn_batch.grad.data = syn_batch.grad.data / world_size
+        # syn_batch.grad.data = syn_batch.grad.data / world_size
         optimizer.step()
         
         # Actual update of model
         optimizer_model.zero_grad()
         # Manual DDP
-        dist.all_reduce(gw_real, op=dist.ReduceOp.SUM) # reduce and average gradient
-        gw_real /= world_size
+        for (pm,pm_grad) in zip(net_parameters, gw_real):
+            dist.all_reduce(pm_grad, op=dist.ReduceOp.SUM,async_op=True) # reduce and average gradient
+            pm_grad /= world_size
+            pm.grad = pm_grad
 
-        flat_param.grad = gw_real
         optimizer_model.step()
         if iter % 10 == 0 and local_rank == 0:
             if iter % 200 == 0 :
