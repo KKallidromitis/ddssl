@@ -129,7 +129,7 @@ def main():
     model = mmcv.ConfigDict(type='VanillaTracker', backbone=cfg.model.backbone)
     model.backbone.out_indices = cfg.test_cfg.out_indices
     model.backbone.strides = cfg.test_cfg.strides
-    model.backbone.pretrained = args.checkpoint
+    model.backbone.pretrained = None #args.checkpoint
     model = build_model(model, train_cfg=None, test_cfg=cfg.test_cfg)
     print(cfg.test_cfg)
     fp16_cfg = cfg.get('fp16', None)

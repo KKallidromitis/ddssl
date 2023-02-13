@@ -2,7 +2,7 @@ from .activitynet_dataset import ActivityNetDataset
 from .base import BaseDataset
 from .builder import build_dataloader, build_dataset
 from .dataset_wrappers import RepeatDataset
-# from .davis_dataset import DavisDataset
+from .davis_dataset import DavisDataset
 from .image_dataset import ImageDataset
 from .jhmdb_dataset import JHMDBDataset
 from .rawframe_dataset import RawframeDataset

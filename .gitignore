@@ -4,3 +4,5 @@
 cache_*.pth
 data
 wandb
+*.pth
+*.log

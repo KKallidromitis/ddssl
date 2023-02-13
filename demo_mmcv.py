@@ -8,6 +8,7 @@ from mmaction.utils import collect_env, get_root_logger
 from mmcv.runner import init_dist, set_random_seed
 from torchreparam import ReparamModule
 from torch.utils.data import DataLoader
+from mmcv.parallel import collate
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -17,8 +18,13 @@ import argparse
 import wandb
 import time
 import datetime
+import mmcv
+from typing import Optional
+from mmaction.apis.test import multi_gpu_test
 
 from torch.nn.parallel import DistributedDataParallel as DDP
+from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.runner.hooks.lr_updater import annealing_cos
 
 parser = argparse.ArgumentParser(description='Detcon-BYOL Training')
 parser.add_argument("--local_rank", metavar="Local Rank", type=int, default=0, 
@@ -27,10 +33,56 @@ parser.add_argument("--cfg", metavar="Config Filename", default="train_imagenet_
                     help="Experiment to run. Default is Imagenet 300 epochs")
 parser.add_argument("--name", metavar="Log Name", default="", 
                     help="Name of wandb entry")
+parser.add_argument("--skip_eval", action="store_true", 
+                    help="skip Davis Evaluation")
+parser.add_argument("--eval_interval",type=int,default=1, 
+                    help="eval intervals")
+parser.add_argument("--batch_size",type=int,default=64, 
+                    help="batch size per gpu")
+parser.add_argument("--num_workers",type=int,default=8, 
+                    help="num of workers")
+parser.add_argument("--inner_loop",type=int,default=10, 
+                    help="num of workers")
+parser.add_argument("--blr",type=float,default=0.05, 
+                    help="base learning rate of vfs")
+parser.add_argument("--weight_decay",type=float,default=0.0001, 
+                    help="weight decay of vfs")
+parser.add_argument("--config",type=str,default= 'configs/r50_sgd_cos_100e_r5_1xNx2_k400.py', 
+                    help="config file")
+
+                   
+
+class CosineAnnealing:
+    """CosineAnnealing LR scheduler.
+
+    Args:
+        min_lr (float, optional): The minimum lr. Default: None.
+        min_lr_ratio (float, optional): The ratio of minimum lr to the base lr.
+            Either `min_lr` or `min_lr_ratio` should be specified.
+            Default: None.
+    """
+
+    def __init__(self,
+                 min_lr: Optional[float] = None,
+                 min_lr_ratio: Optional[float] = None,
+                 **kwargs) -> None:
+        assert (min_lr is None) ^ (min_lr_ratio is None)
+        self.min_lr = min_lr
+        self.min_lr_ratio = min_lr_ratio
+
+    def get_lr(self, base_lr: float,iter,max_iters):
+        progress = iter
+        max_progress = max_iters
+
+        if self.min_lr_ratio is not None:
+            target_lr = base_lr * self.min_lr_ratio
+        else:
+            target_lr = self.min_lr  # type:ignore
+        return annealing_cos(base_lr, target_lr, progress / max_progress)
 
 
 args = parser.parse_args()
-
+print(args)
 import enum
 import wandb
 import matplotlib.pyplot as plt
@@ -94,11 +146,10 @@ train_pipeline = [
     dict(type='ToTensor', keys=['imgs', 'label'])
 ]
 
-class arguments:
-    pass
-args=arguments()
 
-args.config = 'configs/r50_sgd_cos_100e_r5_1xNx2_k400.py'
+#args=arguments()
+
+#args.config = 'configs/r50_sgd_cos_100e_r5_1xNx2_k400.py'
 distributed = False
 timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
 env_info_dict = collect_env()
@@ -148,6 +199,8 @@ def apply_kornia(aug,v,parms=None):
 import os
 cfg.data.train.dataset.pipeline=train_pipeline
 datasets = [build_dataset(cfg.data.train)]
+val_datasets = [build_dataset(cfg.data.val,dict(test_mode=True))]
+lr_scheduler = CosineAnnealing(**cfg.lr_config)
 model = build_model(cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
 #model = ReparamModule(model)
 # model = DDP(model,delay_allreduce=True)
@@ -160,6 +213,10 @@ print(f"init done {rank}")
 sampler = torch.utils.data.DistributedSampler(
             datasets[0], num_replicas=world_size, rank=rank, shuffle=True
 )
+sampler_val = torch.utils.data.DistributedSampler(
+            val_datasets[0], num_replicas=world_size, rank=rank, shuffle=False
+)
+
 
 
 def distance_wb(gwr, gws):
@@ -218,10 +275,44 @@ def calc_match_loss(gw_syn, gw_real, dis_metric='ours'):
 #flat_param = model.flat_param
 net_parameters = list(model.parameters())
 
-optimizer_model = SGD(model.parameters(),lr=0.05, momentum=0.9, weight_decay=0.0001)
-BATCH_SIZE = 64
 
-dataloader = DataLoader(datasets[0],batch_size=BATCH_SIZE,sampler=sampler,num_workers=8,drop_last=True)
+BATCH_SIZE = args.batch_size
+GLOBAL_BATCH_SIZE = BATCH_SIZE * world_size
+LR = args.blr * GLOBAL_BATCH_SIZE / 256 # default 0.05
+optimizer_model = SGD(model.parameters(),lr=LR, momentum=0.9, weight_decay=args.weight_decay)
+
+dataloader = DataLoader(datasets[0],batch_size=BATCH_SIZE,sampler=sampler,num_workers=args.num_workers,drop_last=True)
+
+dataloader_val = DataLoader(val_datasets[0],batch_size=1,sampler=sampler_val,num_workers=args.num_workers,drop_last=False,collate_fn=collate)
+eval_config = cfg.get('eval_config', {})
+
+
+results = []
+
+device = 'cuda'
+torch.cuda.set_device(local_rank)
+
+model_eval = mmcv.ConfigDict(type='VanillaTracker', backbone=cfg.model.backbone)
+model_eval.backbone.out_indices = cfg.test_cfg.out_indices
+model_eval.backbone.strides = cfg.test_cfg.strides
+model_eval.backbone.pretrained = None #args.checkpoint
+model_eval = build_model(model_eval, train_cfg=None, test_cfg=cfg.test_cfg)
+model_eval= MMDistributedDataParallel(
+            model_eval.cuda(),
+            device_ids=[local_rank],
+            broadcast_buffers=False)
+
+
+
+def eval_davis(model):
+    model.eval()
+    model_eval.module.backbone.load_state_dict(model.backbone.state_dict())
+    model_eval.eval()
+    results = multi_gpu_test(model_eval,dataloader_val)
+    if rank==0:
+        results = val_datasets[0].evaluate(results,metrics='davis')
+        return results
+#r = multi_gpu_test(model,dataloader_val)
 
 epoches = 100
 device = 'cuda'
@@ -239,46 +330,72 @@ def set_batch_norm(model,on=True):
 start_time = time.time()
 end = time.time()
 assert BATCH_SIZE * world_size < len(indices) # Cannot have larger global batch size than syn dataset size
-if local_rank == 0:
+if rank == 0:
     wandb.init()
 
+EVAL_INTERVAL = args.eval_interval
+SKIP_EVAL = args.skip_eval
+INNER_LOOP = args.inner_loop
 for epoch in range(epoches):
     sampler.set_epoch(epoch)
     iter = 0
-    
+    new_lr = lr_scheduler.get_lr(LR,epoch*total_iter+iter,epoches*total_iter)
+    for param_group in optimizer_model.param_groups:
+        param_group['lr'] = new_lr
+    if epoch % EVAL_INTERVAL == 0 and not SKIP_EVAL:
+        results = eval_davis(model)
+        if rank == 0:
+            wandb.log(
+                dict(
+                    epoch=epoch,
+                    **results
+                )
+            )
+        dist.barrier()
+    model.train()
+    print(f"EPOCH : {epoch}")
     for batch in dataloader:
-        model.train()
         #TODO: see if there is a smarter way
         idx = np.random.choice(indices,BATCH_SIZE * world_size,replace=False)
         # print(idx[:10]) sanity check to make sure they are in sync
         all_idx = idx
-        idx = idx[BATCH_SIZE*local_rank:BATCH_SIZE*(local_rank+1)]
+        idx = idx[BATCH_SIZE*rank:BATCH_SIZE*(rank+1)]
         syn_batch = video_syn[idx].detach().clone().to(device)
         syn_batch.requires_grad=True
-        real_video_aug,parms = apply_kornia(aug_list,batch['imgs'].to(device))
-        syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
+        try:
+            real_video_aug,parms = apply_kornia(aug_list,batch['imgs'].to(device))
+            syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
+        except:
+            print(aug_list.shape)
+            raise ValueError
         r = model(real_video_aug)
         # disable bn
         for module in model.modules():
             if 'BatchNorm' in module._get_name():  #BatchNorm
                 module.eval() # fix mu and sigma of every BatchNorm layer
-        r_syn = model(syn_video_aug)
+        #r_syn = model(syn_video_aug)
 
         optimizer = SGD([syn_batch,],lr=0.05, momentum=0.9, weight_decay=0.0001)
 
         vfs_loss_real = r['img_head.0.loss_feat' ].mean()
-        vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
+        #vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
         gw_real = torch.autograd.grad(vfs_loss_real, net_parameters,retain_graph=True)
         gw_real = list((x.detach() for x in gw_real))
-        gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
+        match_loss = torch.FloatTensor([0.0,]).mean()
+        vfs_loss_syn = torch.FloatTensor([0.0,]).mean()
+        for _ in range(INNER_LOOP):
+            syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
+            r_syn = model(syn_video_aug)
+            vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
+            gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
 
-        # do match SGD
-        match_loss = calc_match_loss(gw_real,gw_syn)
-        
-        optimizer.zero_grad()
-        match_loss.backward()
-        # syn_batch.grad.data = syn_batch.grad.data / world_size
-        optimizer.step()
+            # do match SGD
+            match_loss = calc_match_loss(gw_real,gw_syn)
+            
+            optimizer.zero_grad()
+            match_loss.backward()
+            # syn_batch.grad.data = syn_batch.grad.data / world_size
+            optimizer.step()
         
         # Actual update of model
         optimizer_model.zero_grad()
@@ -289,14 +406,18 @@ for epoch in range(epoches):
             pm.grad = pm_grad
 
         optimizer_model.step()
-        if iter % 10 == 0 and local_rank == 0:
+        # TODO: Check manual DDP is equivalent to actual DDP
+        if iter % 10 == 0 and rank == 0:
             if iter % 200 == 0 :
                 # log image # B X N X C X T X H X W
                 img = syn_batch[0,:,:,0].detach().cpu().numpy().transpose(0,2,3,1)
-                wandb_dump_img([img[0],img[1]],'img0')
+                wandb_dump_img([img[0],img[1]],'img_syn')
+                img = real_video_aug[0,:,:,0].detach().cpu().numpy().transpose(0,2,3,1)
+                wandb_dump_img([img[0],img[1]],'img_real')
             wandb.log(
                 dict(
                     epoch=epoch,
+                    lr=new_lr,
                     iter=iter,
                     match_loss=match_loss.item(),
                     vfs_loss_real=vfs_loss_real.item(),
@@ -315,4 +436,4 @@ for epoch in range(epoches):
         torch.cuda.empty_cache()
     # todo: Save model state parms, and add eval pipeline
     if epoch % 1 == 0:
-        torch.save(flat_param,f'checkpoint_{epoch}.pth')
+        torch.save(model.state_dict(),f'checkpoint_{epoch}.pth')
