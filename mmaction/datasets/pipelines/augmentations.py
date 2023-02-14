@@ -1312,11 +1312,10 @@ class ColorJitter(object):
                 trans = _ColorJitter.get_params(self.brightness, self.contrast,
                                                 self.saturation, self.hue)
             if apply:
-                print(trans)
-                print(trans(Image.fromarray(img)))
+
                 img = np.array(trans(Image.fromarray(img)))
                 results['imgs'][i] = img
-                print(1)
+
         return results
 
 

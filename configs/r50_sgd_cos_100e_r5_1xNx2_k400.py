@@ -6,13 +6,13 @@ model = dict(
         pretrained=None,
         depth=50,
         out_indices=(3, ),
-        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=False,
         zero_init_residual=True),
     img_head=dict(
         type='SimSiamHead',
         in_channels=2048,
-        norm_cfg=dict(type='SyncBN'),
+        norm_cfg=dict(type='BN'),
         num_projection_fcs=3,
         projection_mid_channels=2048,
         projection_out_channels=2048,
@@ -65,15 +65,15 @@ train_pipeline = [
         flip_ratio=0.5,
         same_across_clip=False,
         same_on_clip=False),
-    dict(
-        type='ColorJitter',
-        brightness=0.4,
-        contrast=0.4,
-        saturation=0.4,
-        hue=0.1,
-        p=0.8,
-        same_across_clip=False,
-        same_on_clip=False),
+    # dict(
+    #     type='ColorJitter',
+    #     brightness=0.4,
+    #     contrast=0.4,
+    #     saturation=0.4,
+    #     hue=0.1,
+    #     p=0.8,
+    #     same_across_clip=False,
+    #     same_on_clip=False),
     dict(
         type='RandomGrayScale',
         p=0.2,
@@ -103,7 +103,7 @@ val_pipeline = [
     dict(type='ToTensor', keys=['imgs', 'ref_seg_map'])
 ]
 data = dict(
-    videos_per_gpu=32,
+    videos_per_gpu=64,
     workers_per_gpu=16,
     val_workers_per_gpu=1,
     train=dict(

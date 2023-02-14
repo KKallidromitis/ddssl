@@ -112,15 +112,16 @@ train_pipeline = [
     dict(type='DecordDecode'),
     dict(
         type='RandomResizedCrop',
-        area_range=(0.2, 1.),
+        area_range=(0.99, 1.00),
         same_across_clip=False,
         same_on_clip=False),
-    dict(type='Resize', scale=(224, 224), keep_ratio=False),
-    dict(
-        type='Flip',
-        flip_ratio=0.5,
-        same_across_clip=False,
-        same_on_clip=False),
+    dict(type='Resize', scale=(256, 256), keep_ratio=False),
+    # dict(type='PadTo', size=(512, 512), keep_ratio=True),
+    # dict(
+    #     type='Flip',
+    #     flip_ratio=0.5,
+    #     same_across_clip=False,
+    #     same_on_clip=False),
     # dict(
     #     type='ColorJitter',
     #     brightness=0.4,
@@ -140,7 +141,7 @@ train_pipeline = [
     #     p=0.5,
     #     same_across_clip=False,
     #     same_on_clip=False),
-    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Normalize', mean=[0.0, 0.0, 0.0], std=[255.0, 255.0, 255.0], to_bgr=False),
     dict(type='FormatShape', input_format='NCTHW'),
     dict(type='Collect', keys=['imgs', 'label'], meta_keys=[]),
     dict(type='ToTensor', keys=['imgs', 'label'])
@@ -169,31 +170,43 @@ import kornia
 import numpy as np
 from kornia.augmentation import VideoSequential
 import wandb
-CROP_SIZE = 100
+CROP_SIZE = 224
 aug_list = VideoSequential(
     kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
     kornia.color.BgrToRgb(),
-    kornia.augmentation.RandomAffine(360, p=1.0),
-    kornia.augmentation.CenterCrop(CROP_SIZE),
+    #kornia.augmentation.RandomAffine(360, p=1.0),
+    kornia.augmentation.RandomResizedCrop((CROP_SIZE,CROP_SIZE),scale=(0.2,1.0)),
+    #kornia.augmentation.CenterCrop(CROP_SIZE),
     kornia.augmentation.PadTo((CROP_SIZE,CROP_SIZE)),
+    kornia.augmentation.RandomHorizontalFlip(),
+    kornia.augmentation.RandomGrayscale(p=0.2),
+    kornia.augmentation.RandomGaussianBlur(kernel_size=(3,3),sigma=(0.1, 0.2),p=0.5),
+    kornia.augmentation.Normalize(mean=np.array(img_norm_cfg['mean'])/255,std=np.array(img_norm_cfg['std'])/255),
     random_apply=10,
     data_format="BCTHW",
     same_on_frame=True)
 
+norm_kornia = VideoSequential(
+    kornia.augmentation.Normalize(mean=np.array(img_norm_cfg['mean'])/255,std=np.array(img_norm_cfg['std'])/255),
+    data_format="BCTHW",
+same_on_frame=True)
+
 # cfg.data.train['pipeline']=train_pipeline
 SIZE = 2350   # 1p
 indices = list(range(SIZE))
-video_syn = torch.randn(size=(SIZE, 2, 3, 1, 224, 224), dtype=torch.float, requires_grad=False)
+video_syn = torch.rand(size=(SIZE, 2, 3, 1, 256, 256), dtype=torch.float, requires_grad=False)
 # label_syn = torch.tensor([np.ones(args.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,
 def apply_kornia(aug,v,parms=None):
-    v = v.permute(0,2,1,3,4,5)
-    b,c,n,t,h,w = v.shape
-    v = v.view(b,c,n*t,h,w)
+    #v = v.permute(0,2,1,3,4,5)
+    b,n,c,t,h,w = v.shape
+    v = v.view(b*n,c,t,h,w)
     if parms is not None:
         v = aug_list(v,params=parms)
+        #v = norm_kornia(v)
     else:
         v = aug_list(v)
-    v = v.view(b,c,n,t,*v.shape[-2:]).permute(0,2,1,3,4,5)
+        #v = norm_kornia(v)
+    v = v.view(b,n,c,t,*v.shape[-2:])#.permute(0,2,1,3,4,5)
     return v,aug._params
 
 import os
@@ -237,6 +250,22 @@ def distance_wb(gwr, gws):
     dis_weight = torch.sum(1 - torch.sum(gwr * gws, dim=-1) / (torch.norm(gwr, dim=-1) * torch.norm(gws, dim=-1) + 0.000001))
     dis = dis_weight
     return dis
+
+from collections import OrderedDict
+def parse_loss_dict(losses):
+    log_vars = OrderedDict()
+    for loss_name, loss_value in losses.items():
+        if isinstance(loss_value, torch.Tensor):
+            log_vars[loss_name] = loss_value.mean()
+        elif isinstance(loss_value, list):
+            log_vars[loss_name] = sum(_loss.mean() for _loss in loss_value)
+        else:
+            raise TypeError(
+                f'{loss_name} is not a tensor or list of tensors')
+
+    loss = sum(_value for _key, _value in log_vars.items()
+                if 'loss' in _key)
+    return loss
 
 def calc_match_loss(gw_syn, gw_real, dis_metric='ours'):
     dis = torch.tensor(0.0).to(gw_real[0].device)
@@ -318,6 +347,7 @@ epoches = 100
 device = 'cuda'
 torch.cuda.set_device(local_rank)
 model.to(device)
+#model = DDP(model)
 model.train()
 np.random.seed(0)
 total_iter = len(datasets[0]) // (BATCH_SIZE * world_size)
@@ -366,18 +396,21 @@ for epoch in range(epoches):
             real_video_aug,parms = apply_kornia(aug_list,batch['imgs'].to(device))
             syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
         except:
-            print(aug_list.shape)
+            print(real_video_aug.shape)
+            print(syn_video_aug.shape)
             raise ValueError
         r = model(real_video_aug)
         # disable bn
-        for module in model.modules():
-            if 'BatchNorm' in module._get_name():  #BatchNorm
-                module.eval() # fix mu and sigma of every BatchNorm layer
+        
+        # for module in model.modules():
+        #     if 'BatchNorm' in module._get_name():  #BatchNorm
+        #         module.eval() # fix mu and sigma of every BatchNorm layer
+        
         #r_syn = model(syn_video_aug)
 
         optimizer = SGD([syn_batch,],lr=0.05, momentum=0.9, weight_decay=0.0001)
 
-        vfs_loss_real = r['img_head.0.loss_feat' ].mean()
+        vfs_loss_real = parse_loss_dict(r)
         #vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
         gw_real = torch.autograd.grad(vfs_loss_real, net_parameters,retain_graph=True)
         gw_real = list((x.detach() for x in gw_real))
@@ -386,7 +419,7 @@ for epoch in range(epoches):
         for _ in range(INNER_LOOP):
             syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
             r_syn = model(syn_video_aug)
-            vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
+            vfs_loss_syn = parse_loss_dict(r_syn)
             gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
 
             # do match SGD
