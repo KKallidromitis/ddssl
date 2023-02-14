@@ -6,3 +6,5 @@ data
 wandb
 *.pth
 *.log
+ckpt
+work_dirs

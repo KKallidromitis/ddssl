@@ -182,7 +182,7 @@ aug_list = VideoSequential(
     kornia.augmentation.RandomGrayscale(p=0.2),
     kornia.augmentation.RandomGaussianBlur(kernel_size=(3,3),sigma=(0.1, 0.2),p=0.5),
     kornia.augmentation.Normalize(mean=np.array(img_norm_cfg['mean'])/255,std=np.array(img_norm_cfg['std'])/255),
-    random_apply=10,
+    random_apply=False,
     data_format="BCTHW",
     same_on_frame=True)
 
@@ -191,10 +191,11 @@ norm_kornia = VideoSequential(
     data_format="BCTHW",
 same_on_frame=True)
 
+
 # cfg.data.train['pipeline']=train_pipeline
 SIZE = 2350   # 1p
 indices = list(range(SIZE))
-video_syn = torch.rand(size=(SIZE, 2, 3, 1, 256, 256), dtype=torch.float, requires_grad=False)
+video_syn = torch.randn(size=(SIZE, 2, 3, 1, 256, 256), dtype=torch.float, requires_grad=False)
 # label_syn = torch.tensor([np.ones(args.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,
 def apply_kornia(aug,v,parms=None):
     #v = v.permute(0,2,1,3,4,5)
@@ -366,6 +367,12 @@ if rank == 0:
 EVAL_INTERVAL = args.eval_interval
 SKIP_EVAL = args.skip_eval
 INNER_LOOP = args.inner_loop
+now = datetime.datetime.now()
+ROOT_DIR = f'./ckpt/{now.strftime("%m-%d-%Y")}'
+import pathlib
+
+pathlib.Path(ROOT_DIR).mkdir(parents=True,exist_ok=True)
+
 for epoch in range(epoches):
     sampler.set_epoch(epoch)
     iter = 0
@@ -408,7 +415,7 @@ for epoch in range(epoches):
         
         #r_syn = model(syn_video_aug)
 
-        optimizer = SGD([syn_batch,],lr=0.05, momentum=0.9, weight_decay=0.0001)
+        optimizer = SGD([syn_batch,],lr=0.05, momentum=0.9, weight_decay=0.01)
 
         vfs_loss_real = parse_loss_dict(r)
         #vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
@@ -417,7 +424,7 @@ for epoch in range(epoches):
         match_loss = torch.FloatTensor([0.0,]).mean()
         vfs_loss_syn = torch.FloatTensor([0.0,]).mean()
         for _ in range(INNER_LOOP):
-            syn_video_aug,_ = apply_kornia(aug_list,syn_batch,parms)
+            syn_video_aug,_ = apply_kornia(aug_list,nn.functional.sigmoid(syn_batch),parms)
             r_syn = model(syn_video_aug)
             vfs_loss_syn = parse_loss_dict(r_syn)
             gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
@@ -469,4 +476,5 @@ for epoch in range(epoches):
         torch.cuda.empty_cache()
     # todo: Save model state parms, and add eval pipeline
     if epoch % 1 == 0:
-        torch.save(model.state_dict(),f'checkpoint_{epoch}.pth')
+        torch.save(model.state_dict(),os.path.join(ROOT_DIR,f'checkpoint_{epoch}.pth'))
+        torch.save(video_syn,os.path.join(ROOT_DIR,f'syn_videos_{epoch}.pth'))
