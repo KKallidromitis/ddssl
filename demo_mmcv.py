@@ -424,7 +424,7 @@ for epoch in range(epoches):
         match_loss = torch.FloatTensor([0.0,]).mean()
         vfs_loss_syn = torch.FloatTensor([0.0,]).mean()
         for _ in range(INNER_LOOP):
-            syn_video_aug,_ = apply_kornia(aug_list,nn.functional.sigmoid(syn_batch),parms)
+            syn_video_aug,_ = apply_kornia(aug_list,torch.sigmoid(syn_batch),parms)
             r_syn = model(syn_video_aug)
             vfs_loss_syn = parse_loss_dict(r_syn)
             gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
