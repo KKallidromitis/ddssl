@@ -36,7 +36,11 @@ def main():
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     args.dsa_param = ParamDiffAug()
     args.dsa = True if args.method == 'DSA' else False
-
+    
+    import wandb
+    wandb.init(project="condensation")
+    wandb.config.update(vars(args))
+    
     if not os.path.exists(args.data_path):
         os.mkdir(args.data_path)
 
@@ -76,7 +80,7 @@ def main():
             print('class c = %d: %d real images'%(c, len(indices_class[c])))
 
         def get_images(c, n): # get random n images from class c
-            idx_shuffle = np.random.permutation(indices_class[c])[:n]
+            #idx_shuffle = np.random.permutation(indices_class[c])[:n]
             idx_shuffle = np.random.randint(0, high=images_all.shape[0], size=256, dtype=int)
             return images_all[idx_shuffle]
 
@@ -126,11 +130,13 @@ def main():
                     for it_eval in range(args.num_eval):
                         net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
                         image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
+                        #import ipdb;ipdb.set_trace() #check eval
                         _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args)
                         #acc_train, acc_test = 0,0
                         accs.append(acc_test)
+                        wandb.log({"acc_train": acc_train,"acc_test":acc_test})
                     print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
-
+                    
                     if it == args.Iteration: # record the final results
                         accs_all_exps[model_eval] += accs
 
@@ -153,9 +159,8 @@ def main():
             loss_avg = 0
             args.dc_aug_param = None  # Mute the DC augmentation when learning synthetic data (in inner-loop epoch function) in oder to be consistent with DC paper.
 
-
             for ol in range(args.outer_loop):
-
+                
                 ''' freeze the running mu and sigma for BatchNorm layers '''
                 # Synthetic data batch, e.g. only 1 image/batch, is too small to obtain stable mu and sigma.
                 # So, we calculate and freeze mu and sigma for BatchNorm layer with real data batch ahead.
@@ -224,7 +229,8 @@ def main():
 
             if it%10 == 0:
                 print('%s iter = %04d, loss = %.4f' % (get_time(), it, loss_avg))
-
+                wandb.log({"loss_avg": loss_avg})
+                
             if it == args.Iteration: # only record the final results
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
                 torch.save({'data': data_save, 'accs_all_exps': accs_all_exps, }, os.path.join(args.save_path, 'res_%s_%s_%s_%dipc.pt'%(args.method, args.dataset, args.model, args.ipc)))

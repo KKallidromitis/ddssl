@@ -1,3 +1,9 @@
 .*
 !/.gitignore
 data/*
+result/*
+result_init/*
+syn_data/*
+wandb/*
+**/__pycache__/
+**/*.ipynb_checkpoints/

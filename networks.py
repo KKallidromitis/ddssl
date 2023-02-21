@@ -128,7 +128,8 @@ class LeNet(nn.Module):
         self.fc_3 = nn.Linear(84, num_classes)
 
     def forward(self, x):
-        x = self.features(x)
+        #import ipdb;ipdb.set_trace()
+        x = self.features(x).contiguous()
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc_1(x))
         x = F.relu(self.fc_2(x))
@@ -159,7 +160,7 @@ class AlexNet(nn.Module):
         self.fc = nn.Linear(192 * 4 * 4, num_classes)
 
     def forward(self, x):
-        x = self.features(x)
+        x = self.features(x).contiguous()
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
