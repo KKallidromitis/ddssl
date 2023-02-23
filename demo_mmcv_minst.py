@@ -12,7 +12,7 @@ from mmcv.parallel import collate
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.optim import SGD
+from torch.optim import SGD,AdamW
 import torch.distributed as dist
 import argparse
 import wandb
@@ -25,6 +25,13 @@ from mmaction.apis.test import multi_gpu_test
 from torch.nn.parallel import DistributedDataParallel as DDP
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner.hooks.lr_updater import annealing_cos
+from  torch.utils.data import TensorDataset,Subset
+from utils import get_network
+import numpy as np 
+np.random.seed(0)
+torch.cuda.manual_seed(0)
+torch.manual_seed(0)
+
 
 parser = argparse.ArgumentParser(description='Detcon-BYOL Training')
 parser.add_argument("--local_rank", metavar="Local Rank", type=int, default=0, 
@@ -45,12 +52,14 @@ parser.add_argument("--inner_loop",type=int,default=10,
                     help="num of workers")
 parser.add_argument("--blr",type=float,default=0.05, 
                     help="base learning rate of vfs")
+parser.add_argument("--lr_img",type=float,default=0.1, 
+                    help="base learning rate of vfs")
 parser.add_argument("--weight_decay",type=float,default=0.0001, 
                     help="weight decay of vfs")
 parser.add_argument("--config",type=str,default= 'configs/r50_sgd_cos_100e_r5_1xNx2_k400.py', 
                     help="config file")
 
-                   
+IM_SIZE = 32            
 
 class CosineAnnealing:
     """CosineAnnealing LR scheduler.
@@ -90,7 +99,7 @@ from matplotlib.pyplot import figure
 
 def wandb_dump_img(imgs,category):
     n_imgs = len(imgs)
-    fig, axes = plt.subplots(1,n_imgs,figsize=(5*n_imgs, 5))
+    fig, axes = plt.subplots(1,n_imgs,figsize=(2*n_imgs, 2))
     #raw, kmeans on 
     fig.tight_layout()
     for idx,img in enumerate(imgs):
@@ -115,7 +124,7 @@ train_pipeline = [
         area_range=(0.99, 1.00),
         same_across_clip=False,
         same_on_clip=False),
-    dict(type='Resize', scale=(256, 256), keep_ratio=False),
+    dict(type='Resize', scale=(IM_SIZE, IM_SIZE), keep_ratio=False),
     # dict(type='PadTo', size=(512, 512), keep_ratio=True),
     # dict(
     #     type='Flip',
@@ -171,7 +180,7 @@ import numpy as np
 from kornia.augmentation import VideoSequential,ImageSequential
 import wandb
 from torchvision.transforms import ToTensor,Resize,Compose
-CROP_SIZE = 224
+CROP_SIZE = 32
 aug_list = ImageSequential(
     # kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
     # kornia.color.BgrToRgb(),
@@ -182,8 +191,16 @@ aug_list = ImageSequential(
     #kornia.augmentation.RandomHorizontalFlip(),
     #kornia.augmentation.RandomGrayscale(p=0.2),
     #kornia.augmentation.RandomGaussianBlur(kernel_size=(3,3),sigma=(0.1, 0.2),p=0.5),
-    #kornia.augmentation.Normalize(mean=np.array(img_norm_cfg['mean'])/255,std=np.array(img_norm_cfg['std'])/255),
+    kornia.augmentation.Normalize(mean=np.array([0.1307,0.1307,0.1307]),std=np.array([0.3081,0.3081,0.3081])),
     random_apply=False)
+
+MNIST_mean = 0.1307
+MNIST_std = 0.3081
+
+aug_syn = ImageSequential(
+    kornia.augmentation.RandomGaussianBlur(kernel_size=(32,32),sigma=(0.1, 4.0),p=0.2),
+    random_apply=False
+)
 
 norm_kornia = VideoSequential(
     kornia.augmentation.Normalize(mean=np.array(img_norm_cfg['mean'])/255,std=np.array(img_norm_cfg['std'])/255),
@@ -193,7 +210,8 @@ same_on_frame=True)
 
 # cfg.data.train['pipeline']=train_pipeline
 SIZE = 100   # 1p
-indices = list(range(SIZE))
+
+
 
 # label_syn = torch.tensor([np.ones(args.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,
 def apply_kornia(aug,v,parms=None):
@@ -214,17 +232,24 @@ from torchvision.datasets import MNIST
 from torchvision.models import resnet18
 import torchvision
 cfg.data.train.dataset.pipeline=train_pipeline
-dataset = MNIST(root='data/mnist',download=True,transform=Compose(
-    [Resize((256,256)),
+tansform_dataset = Compose(
+    [Resize((IM_SIZE,IM_SIZE)),
     ToTensor(),
     torchvision.transforms.Lambda(lambda x: x.repeat(3, 1, 1) )
     ]
-))
-datasets = [dataset]
-val_datasets = [dataset]
+)
+dataset = MNIST(root='data/mnist',download=True,transform=tansform_dataset)
+indices = list(range(len(dataset)))
+np.random.shuffle(indices)
+cutoff = int(len(dataset) * 0.9)
+indices_train = indices[:cutoff]
+dataset_train = Subset(dataset,indices_train)
+dataset_val= Subset(dataset,indices[cutoff:])
+datasets = [dataset_train]
+val_datasets = [dataset_train]
 lr_scheduler = CosineAnnealing(**cfg.lr_config)
 model = resnet18(pretrained=False,num_classes=10)
-
+#model = get_network('ConvNet',3,10,(CROP_SIZE,CROP_SIZE),no_device=True)
 #model = ReparamModule(model)
 # model = DDP(model,delay_allreduce=True)
 
@@ -309,7 +334,7 @@ def calc_match_loss(gw_syn, gw_real, dis_metric='ours'):
     else:
         exit('unknown distance function: %s'%dis_metric)
 
-    return dis
+    return dis / len(gw_real)
 
 #flat_param = model.flat_param
 net_parameters = list(model.parameters())
@@ -343,8 +368,58 @@ torch.cuda.set_device(local_rank)
 
 
 
-def eval_davis(model):
-    return {}
+def eval_davis(data):
+    data = data.detach().cpu()
+    dataset = TensorDataset(data)
+    sampler = torch.utils.data.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    sampler_eval = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    model = resnet18(pretrained=False,num_classes=10)
+    model.to(device)
+    model = DDP(model)
+    model.train()
+    optimizer_model = SGD(model.parameters(),lr=LR, momentum=0.9, weight_decay=args.weight_decay)
+    dataloader = DataLoader(dataset,sampler=sampler,batch_size=256)
+    for epoch in range(500):
+        for syn_batch in dataloader:
+            syn_batch = syn_batch[0]
+            syn_batch_data = syn_batch[...,:-10]#.reshape(-1,3,IM_SIZE,IM_SIZE).detach()
+            model_vae.eval()
+            with torch.no_grad():
+                syn_batch_data ,_= model_vae(syn_batch_data.to(device))
+                syn_batch_labels = syn_batch[...,-10:].detach()
+                syn_video_aug = aug_list(syn_batch_data)
+            r_syn = model(syn_video_aug.to(device))
+            vfs_loss_syn = nn.functional.cross_entropy(r_syn,torch.softmax(syn_batch_labels.to(device),dim=-1))
+            optimizer_model.zero_grad()
+            # Manual DDP
+            vfs_loss_syn.backward()
+            optimizer_model.step()
+    model.eval()
+    eval_loader = DataLoader(dataset_val,batch_size=256,sampler=sampler_eval,drop_last=False)
+    acc = torch.FloatTensor([0.0,]).mean()
+    for imgs, labels in eval_loader:
+        labels = labels.to(device)
+        with torch.no_grad():
+            r = model(imgs.to(device)) # N X C
+            r = r.argmax(-1)
+        acc = acc + (r == labels).sum()
+    dist.all_reduce(acc, op=dist.ReduceOp.SUM)
+    acc = acc.item()
+    payload =  dict(
+        acc= acc / len(dataset_val),
+        n=len(dataset_val),
+        correct=acc,
+    )
+    if rank ==0:
+        wandb.log(
+            payload
+        )
+    print(payload)
+    return payload
     pass
     # model.eval()
     # model_eval.module.backbone.load_state_dict(model.backbone.state_dict())
@@ -361,12 +436,9 @@ torch.cuda.set_device(local_rank)
 model.to(device)
 #model = DDP(model)
 model.train()
-np.random.seed(0)
-torch.cuda.manual_seed(0)
-torch.manual_seed(0)
 
 total_iter = len(datasets[0]) // (BATCH_SIZE * world_size)
-video_syn = torch.randn(size=(SIZE, 3*256*256+10), dtype=torch.float, requires_grad=False).to(device)
+video_syn = torch.randn(size=(SIZE, 256*2+10), dtype=torch.float, requires_grad=False).to(device)
 video_syn.requires_grad=True
 dist.broadcast(video_syn,0)
 # sync
@@ -385,13 +457,33 @@ if rank == 0:
 EVAL_INTERVAL = args.eval_interval
 SKIP_EVAL = args.skip_eval
 INNER_LOOP = args.inner_loop
+INNER_INNER_LOOP = 10
 now = datetime.datetime.now()
 ROOT_DIR = f'./ckpt/{now.strftime("%m-%d-%Y")}'
+
 import pathlib
 
 pathlib.Path(ROOT_DIR).mkdir(parents=True,exist_ok=True)
-optimizer = SGD([video_syn,],lr=0.1, momentum=0.5, weight_decay=0.01)
-BATCH_SIZE_SYN = 64
+optimizer = SGD([video_syn,],lr=args.lr_img, momentum=0.5,weight_decay=args.weight_decay)
+BATCH_SIZE_SYN = BATCH_SIZE
+
+num_classes = 10
+indices_class = [[] for c in range(num_classes)]
+images_all = torch.cat([torch.unsqueeze(datasets[0][i][0],0) for i in range(len(datasets[0]))])
+labels_all = dataset.targets[indices_train]
+for i, lab in enumerate(labels_all):
+        indices_class[lab].append(i)
+def get_images(n):
+    #print(images_all.shape[0])
+    idx_shuffle = np.random.randint(0, high=images_all.shape[0], size=n, dtype=int)
+    return images_all[idx_shuffle]
+
+from lib.diffusion import VAE
+model_vae = VAE(3)
+model_vae = model_vae.to(device)
+model_vae = DDP(model_vae)
+optimizer_vae = SGD(model_vae.parameters(),lr=1e-3, momentum=0.9, weight_decay=args.weight_decay)
+
 for epoch in range(epoches):
     sampler.set_epoch(epoch)
     iter = 0
@@ -399,7 +491,7 @@ for epoch in range(epoches):
     for param_group in optimizer_model.param_groups:
         param_group['lr'] = new_lr
     if epoch % EVAL_INTERVAL == 0 and not SKIP_EVAL:
-        results = eval_davis(model)
+        results = eval_davis(video_syn)
         if rank == 0:
             wandb.log(
                 dict(
@@ -411,98 +503,119 @@ for epoch in range(epoches):
     model.train()
     print(f"EPOCH : {epoch}")
     for batch in dataloader:
-        #TODO: see if there is a smarter way
-        idx = np.random.choice(indices,BATCH_SIZE_SYN * world_size,replace=True)
-        # print(idx[:10]) sanity check to make sure they are in sync
+        idx = np.random.choice(list(range(len(video_syn))),BATCH_SIZE * world_size,replace=True)
         all_idx = idx
-        idx = idx[BATCH_SIZE_SYN*rank:BATCH_SIZE_SYN*(rank+1)]
-        real_imgs = batch[0]
-        real_labels = batch[1].to(device)
+        idx = idx[BATCH_SIZE*0:BATCH_SIZE*(0+1)]
+
+
+
+        # update BN
+
+        
+        model.train()
+        real_imgs = get_images(256)
+
         real_video_aug = aug_list(real_imgs.to(device))
-        parms = aug_list._params 
-        #syn_video_aug,_ = aug_list(syn_batch.to(device))
-
         r = model(real_video_aug)
-        loss_real = nn.functional.cross_entropy(r,real_labels)
-        # disable bn
+        #update VAE
+        model_vae.train()
+        out, mu, logVar,vae_loss = model_vae(real_video_aug)
+        optimizer_vae.zero_grad()
+        vae_loss.backward()
+        optimizer_vae.step()
         
-        # for module in model.modules():
-        #     if 'BatchNorm' in module._get_name():  #BatchNorm
-        #         module.eval() # fix mu and sigma of every BatchNorm layer
-        
-        #r_syn = model(syn_video_aug)
-
-       
-
-        vfs_loss_real = loss_real
-        #vfs_loss_syn = r_syn['img_head.0.loss_feat' ].mean()
-        gw_real = torch.autograd.grad(vfs_loss_real, net_parameters,retain_graph=True)
-        gw_real = list((x.detach() for x in gw_real))
+        for module in model.modules():
+            if 'BatchNorm' in module._get_name():  #BatchNorm
+                module.eval() # fix mu and sigma of every BatchNorm layer
         match_loss = torch.FloatTensor([0.0,]).mean().to(device)
-        vfs_loss_syn = torch.FloatTensor([0.0,]).mean()
-        for (pm,pm_grad) in zip(net_parameters, gw_real):
-            dist.all_reduce(pm_grad, op=dist.ReduceOp.SUM,async_op=True) # reduce and average gradient
-            pm_grad /= world_size
-            pm.grad = pm_grad
-        for inner_iter in range(INNER_LOOP):
-            syn_batch = video_syn[idx]
-            syn_batch_data = syn_batch[...,:-10].reshape(-1,3,256,256)
+        for _ in range(1):
+            # real loss
+            real_imgs = batch[0]
+            real_labels = batch[1].to(device)
+            real_video_aug = aug_list(real_imgs.to(device))
+            parms = aug_list._params 
+            r = model(real_video_aug)
+            loss_real = nn.functional.cross_entropy(r,real_labels)
+            vfs_loss_real = loss_real
+            gw_real = torch.autograd.grad(vfs_loss_real, net_parameters,retain_graph=True)
+            gw_real = list((x.detach() for x in gw_real))
+            # for (pm,pm_grad) in zip(net_parameters, gw_real):
+            #     dist.all_reduce(pm_grad, op=dist.ReduceOp.SUM,async_op=True) # reduce and average gradient
+            #     pm_grad /= world_size
+            #     pm.grad = pm_grad
+
+            # syn loss
+            syn_batch = video_syn[idx] #* MNIST_std + MNIST_mean
+            syn_batch_data = syn_batch[...,:-10]#.reshape(-1,3,IM_SIZE,IM_SIZE)
+            model_vae.eval()
+            syn_batch_data,z_kl = model_vae.module(syn_batch_data)
             syn_batch_labels = syn_batch[...,-10:]
-            syn_video_aug = aug_list(syn_batch_data)
+            syn_video_aug = aug_list(syn_batch_data,params=parms)
             r_syn = model(syn_video_aug)
-            vfs_loss_syn = nn.functional.cross_entropy(r_syn,torch.sigmoid(syn_batch_labels))
+            vfs_loss_syn = nn.functional.cross_entropy(r_syn,torch.softmax(syn_batch_labels,dim=-1))
             gw_syn = torch.autograd.grad(vfs_loss_syn, net_parameters, create_graph=True)
+            match_loss += calc_match_loss(gw_real,gw_syn) + 0.5 * z_kl
 
-            # do match SGD
-            match_loss = calc_match_loss(gw_real,gw_syn)
-            
+            # do update synthetic data
+        KK = 1
+        if iter % KK == 0:
             optimizer.zero_grad()
-            match_loss.backward()
-
-            dist.all_reduce(video_syn.grad.data, op=dist.ReduceOp.SUM,async_op=True) # reduce and average gradient
-            video_syn.grad.data /= world_size
-            #pm.grad = pm_grad
-            # syn_batch.grad.data = syn_batch.grad.data / world_size
+        match_loss.backward()
+        if iter % KK == 0:
+            #dist.all_reduce(video_syn.grad.data, op=dist.ReduceOp.SUM) # reduce and average gradient
+            video_syn.grad.data /= world_size 
             optimizer.step()
-            if inner_iter % 50 == 0 and rank ==0 :
-                    # log image # B X N X C X T X H X W
-                img = syn_batch_data[:].detach().cpu().numpy().transpose(0,2,3,1)
-                wandb_dump_img([img[0],img[1]],'img_syn')
-                img = real_video_aug[:].detach().cpu().numpy().transpose(0,2,3,1)
-                wandb_dump_img([img[0],img[1]],'img_real')
-                wandb.log(
-                    dict(
-                        epoch=epoch,
-                        lr=new_lr,
-                        iter=iter,
-                        match_loss=match_loss.item(),
-                        vfs_loss_real=vfs_loss_real.item(),
-                        vfs_loss_syn = vfs_loss_syn.item()
-                    )
-                )
-        
-        # Actual update of model
-        optimizer_model.zero_grad()
-        # Manual DDP
-        for (pm,pm_grad) in zip(net_parameters, gw_real):
-            dist.all_reduce(pm_grad, op=dist.ReduceOp.SUM,async_op=True) # reduce and average gradient
-            pm_grad /= world_size
-            pm.grad = pm_grad
 
-        #optimizer_model.step()
+            
+        
+        # # Actual update of model
+        if iter % INNER_LOOP == 0:
+            # Update model on syn netwokrl
+            shuffled_indices = np.array(range(SIZE))
+            np.random.shuffle(shuffled_indices)
+            for ii in range(SIZE//(BATCH_SIZE_SYN * world_size)):
+                if ii % 10 == 0:
+                    print(f"Model Update: Iter {ii}/{SIZE//(BATCH_SIZE_SYN * world_size)}")
+                idx = shuffled_indices[ii*BATCH_SIZE_SYN * world_size:(ii+1)*BATCH_SIZE_SYN * world_size]
+                if len(idx) < BATCH_SIZE_SYN * world_size:
+                    print("Drop Last Batch")
+                    continue
+                idx = idx[BATCH_SIZE_SYN*rank:BATCH_SIZE_SYN*(rank+1)]
+                syn_batch = video_syn[idx]
+                syn_batch_data = syn_batch[...,:-10]#.reshape(-1,3,IM_SIZE,IM_SIZE).detach()
+                model_vae.eval()
+                syn_batch_data,_ = model_vae(syn_batch_data)
+                syn_batch_labels = syn_batch[...,-10:].detach()
+                syn_video_aug = aug_list(syn_batch_data)
+                r_syn = model(syn_video_aug.detach())
+                vfs_loss_syn = nn.functional.cross_entropy(r_syn,torch.softmax(syn_batch_labels,dim=-1))
+                optimizer_model.zero_grad()
+                # Manual DDP
+                vfs_loss_syn.backward()
+                for pm in net_parameters:
+                    dist.all_reduce(pm.grad, op=dist.ReduceOp.SUM) # reduce and average gradient
+                    pm.grad /= world_size
+                optimizer_model.step()
+            
         # TODO: Check manual DDP is equivalent to actual DDP
         if iter % 10 == 0 and rank == 0:
             if iter % 50 == 0 :
                 # log image # B X N X C X T X H X W
                 img = syn_batch_data[:].detach().cpu().numpy().transpose(0,2,3,1)
-                wandb_dump_img([img[0],img[1]],'img_syn')
+                wandb_dump_img(img[:10],'img_syn')
                 img = real_video_aug[:].detach().cpu().numpy().transpose(0,2,3,1)
-                wandb_dump_img([img[0],img[1]],'img_real')
+                wandb_dump_img(img[:10],'img_real')
+                img = out[:].detach().cpu().numpy().transpose(0,2,3,1)
+                wandb_dump_img(img[:10],'img_reconst')
+                with torch.no_grad():
+                    img = model_vae.module.sample(10,device=device).detach().cpu().numpy().transpose(0,2,3,1)
+                wandb_dump_img(img[:10],'img_resample')
             wandb.log(
                 dict(
                     epoch=epoch,
                     lr=new_lr,
                     iter=iter,
+                    vae_loss=vae_loss.item(),
                     match_loss=match_loss.item(),
                     vfs_loss_real=vfs_loss_real.item(),
                     vfs_loss_syn = vfs_loss_syn.item()
@@ -519,6 +632,8 @@ for epoch in range(epoches):
 
         torch.cuda.empty_cache()
     # todo: Save model state parms, and add eval pipeline
-    if epoch % 1 == 0:
-        torch.save(model.state_dict(),os.path.join(ROOT_DIR,f'checkpoint_{epoch}.pth'))
-        torch.save(video_syn,os.path.join(ROOT_DIR,f'syn_videos_{epoch}.pth'))
+    if epoch % 10 == 0:
+        torch.save(dict(
+            model=model.state_dict(),
+            data=video_syn
+            ),os.path.join(ROOT_DIR,f'checkpoint_{epoch}.pth'))

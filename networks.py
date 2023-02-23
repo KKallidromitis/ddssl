@@ -1,12 +1,19 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
 # Acknowledgement to
 # https://github.com/kuangliu/pytorch-cifar,
 # https://github.com/BIGBALLON/CIFAR-ZOO,
 
-# adapted from
-# https://github.com/VICO-UoE/DatasetCondensation
+
+''' Swish activation '''
+class Swish(nn.Module): # Swish(x) = x∗σ(x)
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input):
+        return input * torch.sigmoid(input)
+
 
 ''' MLP '''
 class MLP(nn.Module):
@@ -35,10 +42,14 @@ class ConvNet(nn.Module):
         self.classifier = nn.Linear(num_feat, num_classes)
 
     def forward(self, x):
-        # print("MODEL DATA ON: ", x.get_device(), "MODEL PARAMS ON: ", self.classifier.weight.data.get_device())
         out = self.features(x)
         out = out.view(out.size(0), -1)
         out = self.classifier(out)
+        return out
+
+    def embed(self, x):
+        out = self.features(x)
+        out = out.view(out.size(0), -1)
         return out
 
     def _get_activation(self, net_act):
@@ -48,81 +59,8 @@ class ConvNet(nn.Module):
             return nn.ReLU(inplace=True)
         elif net_act == 'leakyrelu':
             return nn.LeakyReLU(negative_slope=0.01)
-        else:
-            exit('unknown activation function: %s'%net_act)
-
-    def _get_pooling(self, net_pooling):
-        if net_pooling == 'maxpooling':
-            return nn.MaxPool2d(kernel_size=2, stride=2)
-        elif net_pooling == 'avgpooling':
-            return nn.AvgPool2d(kernel_size=2, stride=2)
-        elif net_pooling == 'none':
-            return None
-        else:
-            exit('unknown net_pooling: %s'%net_pooling)
-
-    def _get_normlayer(self, net_norm, shape_feat):
-        # shape_feat = (c*h*w)
-        if net_norm == 'batchnorm':
-            return nn.BatchNorm2d(shape_feat[0], affine=True)
-        elif net_norm == 'layernorm':
-            return nn.LayerNorm(shape_feat, elementwise_affine=True)
-        elif net_norm == 'instancenorm':
-            return nn.GroupNorm(shape_feat[0], shape_feat[0], affine=True)
-        elif net_norm == 'groupnorm':
-            return nn.GroupNorm(4, shape_feat[0], affine=True)
-        elif net_norm == 'none':
-            return None
-        else:
-            exit('unknown net_norm: %s'%net_norm)
-
-    def _make_layers(self, channel, net_width, net_depth, net_norm, net_act, net_pooling, im_size):
-        layers = []
-        in_channels = channel
-        if im_size[0] == 28:
-            im_size = (32, 32)
-        shape_feat = [in_channels, im_size[0], im_size[1]]
-        for d in range(net_depth):
-            layers += [nn.Conv2d(in_channels, net_width, kernel_size=3, padding=3 if channel == 1 and d == 0 else 1)]
-            shape_feat[0] = net_width
-            if net_norm != 'none':
-                layers += [self._get_normlayer(net_norm, shape_feat)]
-            layers += [self._get_activation(net_act)]
-            in_channels = net_width
-            if net_pooling != 'none':
-                layers += [self._get_pooling(net_pooling)]
-                shape_feat[1] //= 2
-                shape_feat[2] //= 2
-
-
-        return nn.Sequential(*layers), shape_feat
-
-
-''' ConvNet '''
-class ConvNetGAP(nn.Module):
-    def __init__(self, channel, num_classes, net_width, net_depth, net_act, net_norm, net_pooling, im_size = (32,32)):
-        super(ConvNetGAP, self).__init__()
-
-        self.features, shape_feat = self._make_layers(channel, net_width, net_depth, net_norm, net_act, net_pooling, im_size)
-        num_feat = shape_feat[0]*shape_feat[1]*shape_feat[2]
-        # self.classifier = nn.Linear(num_feat, num_classes)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier = nn.Linear(shape_feat[0], num_classes)
-
-    def forward(self, x):
-        out = self.features(x)
-        out = self.avgpool(out)
-        out = out.view(out.size(0), -1)
-        out = self.classifier(out)
-        return out
-
-    def _get_activation(self, net_act):
-        if net_act == 'sigmoid':
-            return nn.Sigmoid()
-        elif net_act == 'relu':
-            return nn.ReLU(inplace=True)
-        elif net_act == 'leakyrelu':
-            return nn.LeakyReLU(negative_slope=0.01)
+        elif net_act == 'swish':
+            return Swish()
         else:
             exit('unknown activation function: %s'%net_act)
 
@@ -170,6 +108,7 @@ class ConvNetGAP(nn.Module):
                 shape_feat[2] //= 2
 
         return nn.Sequential(*layers), shape_feat
+
 
 
 ''' LeNet '''
@@ -225,6 +164,48 @@ class AlexNet(nn.Module):
         x = self.fc(x)
         return x
 
+    def embed(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return x
+
+
+''' AlexNetBN '''
+class AlexNetBN(nn.Module):
+    def __init__(self, channel, num_classes):
+        super(AlexNetBN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(channel, 128, kernel_size=5, stride=1, padding=4 if channel==1 else 2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(128, 192, kernel_size=5, padding=2),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(192, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 192, kernel_size=3, padding=1),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(192, 192, kernel_size=3, padding=1),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+        self.fc = nn.Linear(192 * 4 * 4, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+    def embed(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return x
 
 
 ''' VGG '''
@@ -245,6 +226,11 @@ class VGG(nn.Module):
         x = self.features(x)
         x = x.view(x.size(0), -1)
         x = self.classifier(x)
+        return x
+
+    def embed(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
         return x
 
     def _make_layers(self, cfg, norm):
@@ -373,6 +359,15 @@ class ResNet_AP(nn.Module):
         out = self.classifier(out)
         return out
 
+    def embed(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, kernel_size=1, stride=1) # modification
+        out = out.view(out.size(0), -1)
+        return out
 
 def ResNet18BN_AP(channel, num_classes):
     return ResNet_AP(BasicBlock_AP, [2,2,2,2], channel=channel, num_classes=num_classes, norm='batchnorm')
@@ -471,43 +466,14 @@ class ResNet(nn.Module):
         out = self.classifier(out)
         return out
 
-
-class ResNetImageNet(nn.Module):
-    def __init__(self, block, num_blocks, channel=3, num_classes=10, norm='instancenorm'):
-        super(ResNetImageNet, self).__init__()
-        self.in_planes = 64
-        self.norm = norm
-
-        self.conv1 = nn.Conv2d(channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.GroupNorm(64, 64, affine=True) if self.norm == 'instancenorm' else nn.BatchNorm2d(64)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier = nn.Linear(512*block.expansion, num_classes)
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride, self.norm))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
+    def embed(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.maxpool(out)
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        # out = F.avg_pool2d(out, 4)
-        # out = out.view(out.size(0), -1)
-        out = self.avgpool(out)
-        out = torch.flatten(out, 1)
-        out = self.classifier(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
         return out
 
 
@@ -528,9 +494,3 @@ def ResNet101(channel, num_classes):
 
 def ResNet152(channel, num_classes):
     return ResNet(Bottleneck, [3,8,36,3], channel=channel, num_classes=num_classes)
-
-def ResNet18ImageNet(channel, num_classes):
-    return ResNetImageNet(BasicBlock, [2,2,2,2], channel=channel, num_classes=num_classes)
-
-def ResNet6ImageNet(channel, num_classes):
-    return ResNetImageNet(BasicBlock, [1,1,1,1], channel=channel, num_classes=num_classes)

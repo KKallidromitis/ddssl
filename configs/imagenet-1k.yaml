@@ -1,0 +1,8 @@
+data:
+  dataset: ImageNet
+  path: /home/jacklishufan/imagenet/ILSVRC/Data/CLS-LOC/train
+
+lr_config:
+  policy: CosineAnnealing
+  min_lr: 0.0
+  by_epoch: false
